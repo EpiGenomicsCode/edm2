@@ -82,6 +82,9 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     if is_cd and opts.get('cd_dropout') is not None:
         net_dropout = opts.cd_dropout
     c.network_kwargs = dnnlib.EasyDict(class_name='training.networks_edm2.Precond', model_channels=opts.channels, dropout=net_dropout)
+    dout_res = opts.get('dout_resolutions')
+    if dout_res is not None:
+        c.network_kwargs.dout_resolutions = dout_res
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.training_loop.EDM2Loss', P_mean=opts.P_mean, P_std=opts.P_std)
     c.lr_kwargs = dnnlib.EasyDict(func_name='training.training_loop.learning_rate_schedule', ref_lr=opts.lr, ref_batches=opts.decay)
 
@@ -183,6 +186,14 @@ def parse_nimg(s):
         return int(s[:-2]) << 30
     return int(s)
 
+def parse_int_list(s):
+    """Parse a comma-separated list of ints, e.g. '16,8' -> [16, 8]."""
+    if s is None:
+        return None
+    if isinstance(s, list):
+        return s
+    return [int(x.strip()) for x in s.split(',') if x.strip()]
+
 #----------------------------------------------------------------------------
 # Command line interface.
 
@@ -235,6 +246,7 @@ def parse_nimg(s):
 # ── Dropout (OD-6) ──
 @click.option('--cd_dropout',       help='Student dropout for CD (overrides preset)', type=click.FloatRange(min=0, max=1), default=None)
 @click.option('--sync_dropout/--no_sync_dropout', help='Sync CUDA RNG for dropout', default=True, show_default=True)
+@click.option('--dout_resolutions', help='Apply dropout only at these resolutions (e.g. 16,8). None = all.', type=parse_int_list, default=None)
 
 # ── LR overrides for CD (OD-7) ──
 @click.option('--cd_lr',            help='CD-mode ref_lr override. None = use preset LR.', type=float, default=None)

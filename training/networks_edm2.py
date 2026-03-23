@@ -10,8 +10,17 @@
 
 import numpy as np
 import torch
+from contextvars import ContextVar
 from torch_utils import persistence
 from torch_utils import misc
+
+# When False, MPConv skips the in-place forced weight normalization (the
+# `self.weight.copy_(normalize(w))` call) while still applying traditional WN
+# in the forward path.  This is needed during the no-grad target pass of
+# consistency distillation so that the second forward does not mutate weights
+# as a side-effect, preserving exact functional equivalence with the grad pass
+# under synchronized dropout.  Adopted from the TCM codebase.
+inplace_norm_flag = ContextVar('inplace_norm_flag', default=True)
 
 #----------------------------------------------------------------------------
 # Normalize given tensor to unit magnitude with respect to the given
@@ -98,7 +107,8 @@ class MPConv(torch.nn.Module):
         w = self.weight.to(torch.float32)
         if self.training:
             with torch.no_grad():
-                self.weight.copy_(normalize(w)) # forced weight normalization
+                if inplace_norm_flag.get():
+                    self.weight.copy_(normalize(w)) # forced weight normalization
         w = normalize(w) # traditional weight normalization
         w = w * (gain / np.sqrt(w[0].numel())) # magnitude-preserving scaling
         w = w.to(x.dtype)
@@ -125,6 +135,7 @@ class Block(torch.nn.Module):
         res_balance         = 0.3,      # Balance between main branch (0) and residual branch (1).
         attn_balance        = 0.3,      # Balance between main branch (0) and self-attention (1).
         clip_act            = 256,      # Clip output activations. None = do not clip.
+        dout_resolutions    = None,     # Resolutions at which to apply dropout. None = all resolutions.
     ):
         super().__init__()
         self.out_channels = out_channels
@@ -136,6 +147,7 @@ class Block(torch.nn.Module):
         self.res_balance = res_balance
         self.attn_balance = attn_balance
         self.clip_act = clip_act
+        self.dout_resolutions = dout_resolutions
         self.emb_gain = torch.nn.Parameter(torch.zeros([]))
         self.conv_res0 = MPConv(out_channels if flavor == 'enc' else in_channels, out_channels, kernel=[3,3])
         self.emb_linear = MPConv(emb_channels, out_channels, kernel=[])
@@ -157,7 +169,8 @@ class Block(torch.nn.Module):
         c = self.emb_linear(emb, gain=self.emb_gain) + 1
         y = mp_silu(y * c.unsqueeze(2).unsqueeze(3).to(y.dtype))
         if self.training and self.dropout != 0:
-            y = torch.nn.functional.dropout(y, p=self.dropout)
+            if self.dout_resolutions is None or y.shape[-1] in self.dout_resolutions:
+                y = torch.nn.functional.dropout(y, p=self.dropout)
         y = self.conv_res1(y)
 
         # Connect the branches.

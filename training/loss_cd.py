@@ -15,6 +15,7 @@ import torch
 import dnnlib
 from torch_utils import persistence
 from torch_utils import training_stats
+from .networks_edm2 import inplace_norm_flag
 
 from .consistency_ops import (
     make_karras_sigmas,
@@ -351,24 +352,31 @@ class EDMConsistencyDistillLoss:
 
         if general_mask.any():
             with torch.no_grad():
-                if self.sync_dropout:
-                    torch.cuda.set_rng_state(rng_state)
-                    target_x = x_t.clone()
-                    target_x[general_mask] = x_s_teach[general_mask]
-                    target_sigma = sigma_t.clone()
-                    target_sigma[general_mask] = sigma_s[general_mask]
-                    x_hat_full = net(
-                        target_x.float(), target_sigma, labels,
-                    ).to(torch.float64)
-                    x_hat_s_ng = x_hat_full[general_mask]
-                else:
-                    net.eval()
-                    x_hat_s_ng = net(
-                        x_s_teach[general_mask].float(),
-                        sigma_s[general_mask],
-                        labels[general_mask] if labels is not None else None,
-                    ).to(torch.float64)
-                    net.train()
+                # Disable in-place forced weight normalization on the no-grad
+                # pass so that MPConv doesn't mutate weights as a side-effect.
+                # The traditional WN path still normalizes in the forward graph.
+                token = inplace_norm_flag.set(False)
+                try:
+                    if self.sync_dropout:
+                        torch.cuda.set_rng_state(rng_state)
+                        target_x = x_t.clone()
+                        target_x[general_mask] = x_s_teach[general_mask]
+                        target_sigma = sigma_t.clone()
+                        target_sigma[general_mask] = sigma_s[general_mask]
+                        x_hat_full = net(
+                            target_x.float(), target_sigma, labels,
+                        ).to(torch.float64)
+                        x_hat_s_ng = x_hat_full[general_mask]
+                    else:
+                        net.eval()
+                        x_hat_s_ng = net(
+                            x_s_teach[general_mask].float(),
+                            sigma_s[general_mask],
+                            labels[general_mask] if labels is not None else None,
+                        ).to(torch.float64)
+                        net.train()
+                finally:
+                    inplace_norm_flag.reset(token)
 
             ratio_s_b = sigma_bdry[general_mask] / torch.clamp(sigma_s[general_mask], min=tol)
             x_ref_bdry[general_mask] = x_hat_s_ng + ratio_s_b * (x_s_teach[general_mask] - x_hat_s_ng)

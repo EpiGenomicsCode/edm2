@@ -6,7 +6,8 @@
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
 """Train diffusion models according to the EDM2 recipe from the paper
-"Analyzing and Improving the Training Dynamics of Diffusion Models"."""
+"Analyzing and Improving the Training Dynamics of Diffusion Models",
+with optional Multi-Step Consistency Distillation (MSCD) support."""
 
 import os
 import json
@@ -58,7 +59,7 @@ def setup_training_config(preset='edm2-img512-s', **opts):
         dataset_channels = dataset_obj.num_channels
         if c.dataset_kwargs.use_labels and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True, but no labels found in the dataset')
-        del dataset_obj # conserve memory
+        del dataset_obj
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
 
@@ -70,9 +71,17 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     else:
         raise click.ClickException(f'--data: Unsupported channel count {dataset_channels}')
 
+    # Detect CD mode.
+    is_cd = bool(opts.get('teacher'))
+
     # Hyperparameters.
     c.update(total_nimg=opts.duration, batch_size=opts.batch)
-    c.network_kwargs = dnnlib.EasyDict(class_name='training.networks_edm2.Precond', model_channels=opts.channels, dropout=opts.dropout)
+
+    # Network: override dropout for CD mode if the --dropout flag was explicitly set.
+    net_dropout = opts.dropout
+    if is_cd and opts.get('cd_dropout') is not None:
+        net_dropout = opts.cd_dropout
+    c.network_kwargs = dnnlib.EasyDict(class_name='training.networks_edm2.Precond', model_channels=opts.channels, dropout=net_dropout)
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.training_loop.EDM2Loss', P_mean=opts.P_mean, P_std=opts.P_std)
     c.lr_kwargs = dnnlib.EasyDict(func_name='training.training_loop.learning_rate_schedule', ref_lr=opts.lr, ref_batches=opts.decay)
 
@@ -87,6 +96,39 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     c.snapshot_nimg = opts.get('snapshot', 0) or None
     c.checkpoint_nimg = opts.get('checkpoint', 0) or None
     c.seed = opts.get('seed', 0)
+
+    # CD-specific configuration.
+    if is_cd:
+        c.teacher_pkl = opts['teacher']
+        cd_S = opts.get('S', 8)
+        c.cd_kwargs = dict(
+            teacher_pkl_path=opts['teacher'],
+            S=cd_S,
+            T_start=opts.get('T_start', 256),
+            T_end=opts.get('T_end', 1024),
+            T_anneal_kimg=opts.get('T_anneal_kimg', 750),
+            rho=7.0,
+            sigma_min=opts.get('sigma_min', 0.002),
+            sigma_max=opts.get('sigma_max', 80.0),
+            loss_type=opts.get('cd_loss', 'pseudo_huber'),
+            weight_mode=opts.get('cd_weight_mode', 'sqrt_karras'),
+            sigma_data=0.5,
+            sampling_mode=opts.get('sampling_mode', 'vp'),
+            terminal_anchor=opts.get('terminal_anchor', True),
+            terminal_teacher_hop=False,
+            sync_dropout=opts.get('sync_dropout', True),
+        )
+
+        # EMA for validation (OD-2).
+        c.ema_halflife_kimg = opts.get('ema_halflife_kimg', 500.0)
+        c.ema_rampup_ratio = opts.get('ema_rampup', 0.05) or None
+
+        # LR overrides for CD (OD-7).
+        if opts.get('cd_lr') is not None:
+            c.lr_kwargs['ref_lr'] = opts['cd_lr']
+        if opts.get('cd_decay') is not None:
+            c.lr_kwargs['ref_batches'] = opts['cd_decay']
+
     return c
 
 #----------------------------------------------------------------------------
@@ -103,6 +145,11 @@ def print_training_config(run_dir, c):
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
+    if c.get('teacher_pkl'):
+        dist.print0(f'CD mode:                 True')
+        dist.print0(f'Teacher:                 {c.teacher_pkl}')
+        dist.print0(f'CD params:               S={c.cd_kwargs["S"]}, T={c.cd_kwargs["T_start"]}->{c.cd_kwargs["T_end"]}')
+        dist.print0(f'CD loss:                 {c.cd_kwargs["loss_type"]} / {c.cd_kwargs["weight_mode"]}')
     dist.print0()
 
 #----------------------------------------------------------------------------
@@ -170,9 +217,37 @@ def parse_nimg(s):
 @click.option('--seed',             help='Random seed', metavar='INT',                          type=int, default=0, show_default=True)
 @click.option('-n', '--dry-run',    help='Print training options and exit',                     is_flag=True)
 
+# ── Teacher / CD core ──
+@click.option('--teacher',          help='Teacher EDM2 pickle (enables CD mode)', metavar='PKL|URL', type=str, default=None)
+@click.option('--S',                help='Student step count', type=click.IntRange(min=2), default=8, show_default=True)
+@click.option('--T_start',          help='Initial teacher edges', type=click.IntRange(min=2), default=256, show_default=True)
+@click.option('--T_end',            help='Final teacher edges', type=click.IntRange(min=2), default=1024, show_default=True)
+@click.option('--T_anneal_kimg',    help='Teacher edge annealing horizon (kimg)', type=click.IntRange(min=0), default=750, show_default=True)
+@click.option('--cd_loss',          help='CD loss type', type=click.Choice(['huber','l2','l2_root','pseudo_huber']), default='pseudo_huber', show_default=True)
+@click.option('--cd_weight_mode',   help='CD loss weight mode', type=click.Choice(['edm','sqrt_karras','flat','snr','karras','uniform']), default='sqrt_karras', show_default=True)
+@click.option('--sampling_mode',    help='Edge sampling distribution', type=click.Choice(['uniform','vp','edm']), default='vp', show_default=True)
+@click.option('--terminal_anchor/--no_terminal_anchor', help='Anchor terminal edge to 1/T probability', default=True, show_default=True)
+
+# ── Sigma grid bounds (OD-5) ──
+@click.option('--sigma_min',        help='Min sigma for CD Karras grids', type=float, default=0.002, show_default=True)
+@click.option('--sigma_max',        help='Max sigma for CD Karras grids', type=float, default=80.0, show_default=True)
+
+# ── Dropout (OD-6) ──
+@click.option('--cd_dropout',       help='Student dropout for CD (overrides preset)', type=click.FloatRange(min=0, max=1), default=None)
+@click.option('--sync_dropout/--no_sync_dropout', help='Sync CUDA RNG for dropout', default=True, show_default=True)
+
+# ── LR overrides for CD (OD-7) ──
+@click.option('--cd_lr',            help='CD-mode ref_lr override. None = use preset LR.', type=float, default=None)
+@click.option('--cd_decay',         help='CD-mode ref_batches override. 0 = constant LR after rampup.', type=float, default=None)
+
+# ── EMA for validation (OD-2) ──
+@click.option('--ema_halflife_kimg', help='Halflife of exponential validation EMA (kimg)', type=float, default=500.0, show_default=True)
+@click.option('--ema_rampup',       help='EMA rampup ratio (0 = no rampup)', type=float, default=0.05, show_default=True)
+
 def cmdline(outdir, dry_run, **opts):
     """Train diffusion models according to the EDM2 recipe from the paper
-    "Analyzing and Improving the Training Dynamics of Diffusion Models".
+    "Analyzing and Improving the Training Dynamics of Diffusion Models",
+    with optional Multi-Step Consistency Distillation (MSCD) support.
 
     Examples:
 
@@ -182,6 +257,16 @@ def cmdline(outdir, dry_run, **opts):
         --outdir=training-runs/00000-edm2-img512-xs \\
         --data=datasets/img512-sd.zip \\
         --preset=edm2-img512-xs \\
+        --batch-gpu=32
+
+    \b
+    # Consistency distillation from a pre-trained teacher
+    torchrun --standalone --nproc_per_node=8 train_edm2.py \\
+        --outdir=training-runs/00001-cd-img512-s \\
+        --data=datasets/img512-sd.zip \\
+        --preset=edm2-img512-s \\
+        --teacher=path/to/teacher.pkl \\
+        --S=8 --cd_loss=pseudo_huber \\
         --batch-gpu=32
 
     \b

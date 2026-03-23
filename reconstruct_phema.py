@@ -18,8 +18,13 @@ import numpy as np
 import torch
 import dnnlib
 import training.phema
+from torch_utils import persistence
 
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
+
+# Register persistence hooks so pickled snapshots containing CD classes can be loaded.
+persistence.import_hook('training.loss_cd')
+persistence.import_hook('training.consistency_ops')
 
 #----------------------------------------------------------------------------
 # Construct the full path of a network pickle.

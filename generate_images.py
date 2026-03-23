@@ -18,8 +18,13 @@ import torch
 import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
+from torch_utils import persistence
 
 warnings.filterwarnings('ignore', '`resume_download` is deprecated')
+
+# Register persistence hooks so pickled snapshots containing CD classes can be loaded.
+persistence.import_hook('training.loss_cd')
+persistence.import_hook('training.consistency_ops')
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
 warnings.filterwarnings('ignore', '1Torch was not compiled with flash attention')
 

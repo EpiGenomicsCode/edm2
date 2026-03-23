@@ -5,7 +5,7 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-"""Main training loop."""
+"""Main training loop with optional Consistency Distillation (CD) support."""
 
 import os
 import time
@@ -79,6 +79,12 @@ def training_loop(
     force_finite        = True,     # Get rid of NaN/Inf gradients before feeding them to the optimizer.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
+
+    # CD-specific parameters (all None/default = normal diffusion training).
+    teacher_pkl         = None,     # Path to teacher checkpoint. None = normal training.
+    cd_kwargs           = None,     # Dict of CD hyperparams (S, T_start, T_end, etc.)
+    ema_halflife_kimg   = 500.0,    # Halflife of exponential validation EMA (kimg) [CD only]
+    ema_rampup_ratio    = 0.05,     # EMA rampup ratio [CD only]
 ):
     # Initialize.
     prev_status_time = time.time()
@@ -100,6 +106,9 @@ def training_loop(
     assert snapshot_nimg is None or (snapshot_nimg % batch_size == 0 and snapshot_nimg % 1024 == 0)
     assert checkpoint_nimg is None or (checkpoint_nimg % batch_size == 0 and checkpoint_nimg % 1024 == 0)
 
+    # Determine if we're in CD mode.
+    is_cd_mode = (teacher_pkl is not None)
+
     # Setup dataset, encoder, and network.
     dist.print0('Loading dataset...')
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
@@ -120,21 +129,92 @@ def training_loop(
             torch.zeros([batch_gpu, net.label_dim], device=device),
         ], max_nesting=2)
 
+    # CD setup: load teacher, construct CD loss, seed student.
+    teacher_net = None
+    if is_cd_mode:
+        dist.print0(f'Loading teacher from {teacher_pkl}...')
+        if dist.get_rank() != 0:
+            torch.distributed.barrier()
+        with dnnlib.util.open_url(teacher_pkl, verbose=(dist.get_rank() == 0)) as f:
+            teacher_data = pickle.load(f)
+        if dist.get_rank() == 0:
+            torch.distributed.barrier()
+        teacher_net = teacher_data['ema'].eval().requires_grad_(False).to(device)
+
+        # Encoder consistency check (OD-3).
+        teacher_encoder = teacher_data.get('encoder', None)
+        if teacher_encoder is not None:
+            teacher_encoder_cls = type(teacher_encoder).__name__
+            student_encoder_cls = encoder_kwargs['class_name'].split('.')[-1]
+            if teacher_encoder_cls != student_encoder_cls:
+                raise RuntimeError(
+                    f'Encoder mismatch: teacher uses {teacher_encoder_cls!r} but '
+                    f'student config specifies {student_encoder_cls!r}. '
+                    f'Teacher and student must share the same latent space.'
+                )
+
+        # Seed student from teacher if shapes match.
+        try:
+            misc.copy_params_and_buffers(src_module=teacher_net, dst_module=net, require_all=False)
+            dist.print0('[CD INIT] Seeded student from teacher.')
+        except Exception as e:
+            dist.print0(f'[CD INIT] Could not seed from teacher: {e}')
+
+        del teacher_data
+
     # Setup training state.
     dist.print0('Setting up training state...')
     state = dnnlib.EasyDict(cur_nimg=0, total_elapsed_time=0)
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
-    loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
+
+    # DDP: tuned kwargs for CD mode, default for base training.
+    if is_cd_mode:
+        ddp = torch.nn.parallel.DistributedDataParallel(
+            net, device_ids=[device],
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=100,
+        )
+    else:
+        ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
+
+    # Construct loss function.
+    if is_cd_mode:
+        from training.loss_cd import EDMConsistencyDistillLoss
+        loss_fn = EDMConsistencyDistillLoss(
+            teacher_net=teacher_net,
+            teacher_pkl_path=teacher_pkl,
+            **(cd_kwargs or {}),
+        )
+    else:
+        loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs)
+
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs)
+
+    # EMA setup.
+    # For CD mode: run two EMA copies in parallel (OD-2).
+    #   1) phema (PowerFunctionEMA) — unchanged from base EDM2, for post-hoc reconstruction.
+    #   2) ema_val — standard exponential EMA for FID validation and snapshots.
+    # For base training: only phema (existing behavior).
     ema = dnnlib.util.construct_class_by_name(net=net, **ema_kwargs) if ema_kwargs is not None else None
+    ema_val = None
+    if is_cd_mode:
+        ema_val = copy.deepcopy(net).eval().requires_grad_(False)
+        # If student was seeded from teacher, ema_val starts from teacher weights too.
+        dist.print0(f'[CD EMA] Validation EMA: halflife={ema_halflife_kimg} kimg, rampup={ema_rampup_ratio}')
 
     # Load previous checkpoint and decide how long to train.
     checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema)
     checkpoint.load_latest(run_dir)
+
+    # Re-attach teacher after checkpoint load (OD-8).
+    if is_cd_mode and hasattr(loss_fn, 'teacher_net') and loss_fn.teacher_net is None:
+        loss_fn.reload_teacher(device)
+        dist.print0('[CD RESUME] Re-attached teacher after checkpoint load.')
+
     stop_at_nimg = total_nimg
     if slice_nimg is not None:
         granularity = checkpoint_nimg if checkpoint_nimg is not None else snapshot_nimg if snapshot_nimg is not None else batch_size
-        slice_end_nimg = (state.cur_nimg + slice_nimg) // granularity * granularity # round down
+        slice_end_nimg = (state.cur_nimg + slice_nimg) // granularity * granularity
         stop_at_nimg = min(stop_at_nimg, slice_end_nimg)
     assert stop_at_nimg > state.cur_nimg
     dist.print0(f'Training from {state.cur_nimg // 1000} kimg to {stop_at_nimg // 1000} kimg:')
@@ -191,17 +271,42 @@ def training_loop(
 
         # Save network snapshot.
         if snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0) and dist.get_rank() == 0:
-            ema_list = ema.get() if ema is not None else optimizer.get_ema(net) if hasattr(optimizer, 'get_ema') else net
-            ema_list = ema_list if isinstance(ema_list, list) else [(ema_list, '')]
-            for ema_net, ema_suffix in ema_list:
-                data = dnnlib.EasyDict(encoder=encoder, dataset_kwargs=dataset_kwargs, loss_fn=loss_fn)
-                data.ema = copy.deepcopy(ema_net).cpu().eval().requires_grad_(False).to(torch.float16)
-                fname = f'network-snapshot-{state.cur_nimg//1000:07d}{ema_suffix}.pkl'
+            if is_cd_mode:
+                # CD mode: save ema_val as the primary EMA snapshot.
+                data = dnnlib.EasyDict(encoder=encoder, dataset_kwargs=dataset_kwargs)
+                data.ema = copy.deepcopy(ema_val).cpu().eval().requires_grad_(False).to(torch.float16)
+                fname = f'network-snapshot-{state.cur_nimg//1000:07d}.pkl'
                 dist.print0(f'Saving {fname} ... ', end='', flush=True)
                 with open(os.path.join(run_dir, fname), 'wb') as f:
                     pickle.dump(data, f)
                 dist.print0('done')
-                del data # conserve memory
+                del data
+
+                # Also save phema snapshots if enabled.
+                if ema is not None:
+                    ema_list = ema.get() if isinstance(ema.get(), list) else [(ema.get(), '')]
+                    for ema_net, ema_suffix in ema_list:
+                        data = dnnlib.EasyDict(encoder=encoder, dataset_kwargs=dataset_kwargs)
+                        data.ema = copy.deepcopy(ema_net).cpu().eval().requires_grad_(False).to(torch.float16)
+                        fname = f'network-snapshot-{state.cur_nimg//1000:07d}{ema_suffix}.pkl'
+                        dist.print0(f'Saving {fname} ... ', end='', flush=True)
+                        with open(os.path.join(run_dir, fname), 'wb') as f:
+                            pickle.dump(data, f)
+                        dist.print0('done')
+                        del data
+            else:
+                # Base training: save phema snapshots (original behavior).
+                ema_list = ema.get() if ema is not None else optimizer.get_ema(net) if hasattr(optimizer, 'get_ema') else net
+                ema_list = ema_list if isinstance(ema_list, list) else [(ema_list, '')]
+                for ema_net, ema_suffix in ema_list:
+                    data = dnnlib.EasyDict(encoder=encoder, dataset_kwargs=dataset_kwargs, loss_fn=loss_fn)
+                    data.ema = copy.deepcopy(ema_net).cpu().eval().requires_grad_(False).to(torch.float16)
+                    fname = f'network-snapshot-{state.cur_nimg//1000:07d}{ema_suffix}.pkl'
+                    dist.print0(f'Saving {fname} ... ', end='', flush=True)
+                    with open(os.path.join(run_dir, fname), 'wb') as f:
+                        pickle.dump(data, f)
+                    dist.print0('done')
+                    del data
 
         # Save state checkpoint.
         if checkpoint_nimg is not None and (done or state.cur_nimg % checkpoint_nimg == 0) and state.cur_nimg != start_nimg:
@@ -211,6 +316,10 @@ def training_loop(
         # Done?
         if done:
             break
+
+        # Teacher annealing (CD only).
+        if is_cd_mode and hasattr(loss_fn, 'set_global_kimg'):
+            loss_fn.set_global_kimg(state.cur_nimg / 1e3)
 
         # Evaluate loss and accumulate gradients.
         batch_start_time = time.time()
@@ -239,6 +348,16 @@ def training_loop(
         state.cur_nimg += batch_size
         if ema is not None:
             ema.update(cur_nimg=state.cur_nimg, batch_size=batch_size)
+
+        # Update validation EMA (CD mode only, OD-2).
+        if ema_val is not None:
+            ema_halflife_nimg = ema_halflife_kimg * 1000
+            if ema_rampup_ratio is not None and ema_rampup_ratio > 0:
+                ema_halflife_nimg = min(ema_halflife_nimg, state.cur_nimg * ema_rampup_ratio)
+            ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
+            for p_ema, p_net in zip(ema_val.parameters(), net.parameters()):
+                p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+
         cumulative_training_time += time.time() - batch_start_time
 
 #----------------------------------------------------------------------------

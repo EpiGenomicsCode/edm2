@@ -94,6 +94,15 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     c.loss_scaling = opts.get('ls', 1)
     c.cudnn_benchmark = opts.get('bench', True)
 
+    # DataLoader workers.
+    workers = opts.get('workers', 2)
+    c.data_loader_kwargs = dnnlib.EasyDict(
+        class_name='torch.utils.data.DataLoader',
+        pin_memory=True,
+        num_workers=workers,
+        prefetch_factor=2 if workers > 0 else None,
+    )
+
     # I/O-related options.
     c.status_nimg = opts.get('status', 0) or None
     c.snapshot_nimg = opts.get('snapshot', 0) or None
@@ -118,7 +127,7 @@ def setup_training_config(preset='edm2-img512-s', **opts):
             sigma_data=0.5,
             sampling_mode=opts.get('sampling_mode', 'vp'),
             terminal_anchor=opts.get('terminal_anchor', True),
-            terminal_teacher_hop=False,
+            terminal_teacher_hop=opts.get('terminal_teacher_hop', False),
             sync_dropout=opts.get('sync_dropout', True),
         )
 
@@ -131,6 +140,38 @@ def setup_training_config(preset='edm2-img512-s', **opts):
             c.lr_kwargs['ref_lr'] = opts['cd_lr']
         if opts.get('cd_decay') is not None:
             c.lr_kwargs['ref_batches'] = opts['cd_decay']
+
+    # Validation configuration (in-training FID).
+    val_ref = opts.get('val_ref')
+    if val_ref is not None:
+        default_val_steps = opts.get('S', 8) if is_cd else 32
+        c.validation_kwargs = dnnlib.EasyDict(
+            enabled=True,
+            ref=val_ref,
+            every=opts.get('val_every', 1),
+            num_images=opts.get('val_num', 50000),
+            steps=opts.get('val_steps') or default_val_steps,
+            seed=opts.get('val_seed', 0),
+            batch=opts.get('val_batch', 32),
+            sigma_min=opts.get('sigma_min', 0.002),
+            sigma_max=opts.get('sigma_max', 80.0),
+            rho=7.0,
+            at_start=opts.get('val_at_start', False),
+        )
+
+    # Weights & Biases configuration.
+    if opts.get('wandb', False):
+        tags = opts.get('wandb_tags')
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(',') if t.strip()]
+        c.wandb_kwargs = dnnlib.EasyDict(
+            enabled=True,
+            project=opts.get('wandb_project', 'edm2-cd'),
+            entity=opts.get('wandb_entity', None),
+            name=opts.get('wandb_run', None),
+            tags=tags,
+            mode=opts.get('wandb_mode', 'online'),
+        )
 
     return c
 
@@ -153,6 +194,10 @@ def print_training_config(run_dir, c):
         dist.print0(f'Teacher:                 {c.teacher_pkl}')
         dist.print0(f'CD params:               S={c.cd_kwargs["S"]}, T={c.cd_kwargs["T_start"]}->{c.cd_kwargs["T_end"]}')
         dist.print0(f'CD loss:                 {c.cd_kwargs["loss_type"]} / {c.cd_kwargs["weight_mode"]}')
+    if c.get('validation_kwargs') and c.validation_kwargs.get('enabled'):
+        dist.print0(f'Validation:              FID every {c.validation_kwargs.get("every",1)} snapshot(s), {c.validation_kwargs.get("num_images",50000)} images, {c.validation_kwargs.get("steps",8)} steps')
+    if c.get('wandb_kwargs') and c.wandb_kwargs.get('enabled'):
+        dist.print0(f'W&B:                     project={c.wandb_kwargs.get("project")}, entity={c.wandb_kwargs.get("entity")}')
     dist.print0()
 
 #----------------------------------------------------------------------------
@@ -220,6 +265,7 @@ def parse_int_list(s):
 @click.option('--fp16',             help='Enable mixed-precision training', metavar='BOOL',     type=bool, default=True, show_default=True)
 @click.option('--ls',               help='Loss scaling', metavar='FLOAT',                       type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
 @click.option('--bench',            help='Enable cuDNN benchmarking', metavar='BOOL',           type=bool, default=True, show_default=True)
+@click.option('--workers',          help='DataLoader worker processes', metavar='INT',           type=click.IntRange(min=0), default=2, show_default=True)
 
 # I/O-related options.
 @click.option('--status',           help='Interval of status prints', metavar='NIMG',           type=parse_nimg, default='128Ki', show_default=True)
@@ -238,6 +284,7 @@ def parse_int_list(s):
 @click.option('--cd_weight_mode',   help='CD loss weight mode', type=click.Choice(['edm','sqrt_karras','flat','snr','karras','uniform']), default='sqrt_karras', show_default=True)
 @click.option('--sampling_mode',    help='Edge sampling distribution', type=click.Choice(['uniform','vp','edm']), default='vp', show_default=True)
 @click.option('--terminal_anchor/--no_terminal_anchor', help='Anchor terminal edge to 1/T probability', default=True, show_default=True)
+@click.option('--terminal_teacher_hop/--no_terminal_teacher_hop', help='Use teacher hop for terminal edge instead of clean image', default=False, show_default=True)
 
 # ── Sigma grid bounds (OD-5) ──
 @click.option('--sigma_min',        help='Min sigma for CD Karras grids', type=float, default=0.002, show_default=True)
@@ -255,6 +302,23 @@ def parse_int_list(s):
 # ── EMA for validation (OD-2) ──
 @click.option('--ema_halflife_kimg', help='Halflife of exponential validation EMA (kimg)', type=float, default=500.0, show_default=True)
 @click.option('--ema_rampup',       help='EMA rampup ratio (0 = no rampup)', type=float, default=0.05, show_default=True)
+
+# ── FID validation (OD-4) ──
+@click.option('--val_ref',          help='FID reference stats (.npz or URL)', metavar='NPZ|URL', type=str, default=None)
+@click.option('--val_every',        help='Validate every N snapshots', type=click.IntRange(min=1), default=1, show_default=True)
+@click.option('--val_num',          help='Images for FID evaluation', type=int, default=50000, show_default=True)
+@click.option('--val_steps',        help='Sampler steps for validation (None = S)', type=int, default=None)
+@click.option('--val_seed',         help='Validation base seed', type=int, default=0, show_default=True)
+@click.option('--val_batch',        help='Validation batch size per GPU', type=int, default=32, show_default=True)
+@click.option('--val_at_start',     help='Run validation at first snapshot', metavar='BOOL', type=bool, default=False, show_default=True)
+
+# ── Weights & Biases ──
+@click.option('--wandb',            help='Enable W&B logging', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--wandb_project',    help='W&B project name', type=str, default='edm2-cd', show_default=True)
+@click.option('--wandb_entity',     help='W&B entity (user/team)', type=str, default=None)
+@click.option('--wandb_run',        help='W&B run name', type=str, default=None)
+@click.option('--wandb_tags',       help='W&B tags (comma-separated)', type=str, default=None)
+@click.option('--wandb_mode',       help='W&B mode', type=click.Choice(['online','offline','disabled']), default='online', show_default=True)
 
 def cmdline(outdir, dry_run, **opts):
     """Train diffusion models according to the EDM2 recipe from the paper

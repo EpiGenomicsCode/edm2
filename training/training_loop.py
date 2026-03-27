@@ -20,6 +20,8 @@ from torch_utils import training_stats
 from torch_utils import persistence
 from torch_utils import misc
 
+from validation import maybe_validate
+
 #----------------------------------------------------------------------------
 # Uncertainty-based loss function (Equations 14,15,16,21) proposed in the
 # paper "Analyzing and Improving the Training Dynamics of Diffusion Models".
@@ -85,6 +87,12 @@ def training_loop(
     cd_kwargs           = None,     # Dict of CD hyperparams (S, T_start, T_end, etc.)
     ema_halflife_kimg   = 500.0,    # Halflife of exponential validation EMA (kimg) [CD only]
     ema_rampup_ratio    = 0.05,     # EMA rampup ratio [CD only]
+
+    # Validation (FID).
+    validation_kwargs   = None,     # Dict of validation params. None = no in-training validation.
+
+    # Weights & Biases.
+    wandb_kwargs        = None,     # Dict of W&B params. None = no W&B logging.
 ):
     # Initialize.
     prev_status_time = time.time()
@@ -211,6 +219,36 @@ def training_loop(
         loss_fn.reload_teacher(device)
         dist.print0('[CD RESUME] Re-attached teacher after checkpoint load.')
 
+    # W&B initialization.
+    wandb_run = None
+    if wandb_kwargs is not None and wandb_kwargs.get('enabled', False) and dist.get_rank() == 0:
+        try:
+            import wandb as _wandb
+            try:
+                import sys
+                for stream in [sys.stdout, sys.stderr]:
+                    if not hasattr(stream, 'isatty'):
+                        stream.isatty = lambda: False
+            except Exception:
+                pass
+            init_kwargs = dict(
+                project=wandb_kwargs.get('project', 'edm2-cd'),
+                entity=wandb_kwargs.get('entity', None),
+                name=wandb_kwargs.get('name', None),
+                tags=wandb_kwargs.get('tags', None),
+            )
+            mode = wandb_kwargs.get('mode', 'online')
+            if mode in ('offline', 'disabled'):
+                init_kwargs['mode'] = mode
+            wandb_run = _wandb.init(**init_kwargs)
+            try:
+                _wandb.save(os.path.join(run_dir, 'log.txt'), policy='live')
+            except Exception:
+                pass
+        except Exception as _e:
+            dist.print0(f'[W&B] init failed: {_e}')
+            wandb_run = None
+
     stop_at_nimg = total_nimg
     if slice_nimg is not None:
         granularity = checkpoint_nimg if checkpoint_nimg is not None else snapshot_nimg if snapshot_nimg is not None else batch_size
@@ -262,6 +300,16 @@ def training_loop(
                 stats_jsonl.write('{' + ', '.join(items) + '}\n')
                 stats_jsonl.flush()
 
+            # W&B tick-level logging.
+            if wandb_run is not None and dist.get_rank() == 0:
+                try:
+                    import wandb as _wandb
+                    log_dict = {name: value.mean for name, value in training_stats.default_collector.as_dict().items() if np.isfinite(value.mean)}
+                    log_dict['progress_kimg'] = state.cur_nimg / 1e3
+                    _wandb.log(log_dict, commit=True)
+                except Exception as _e:
+                    dist.print0(f'[W&B] log failed: {_e}')
+
             # Update progress and check for abort.
             dist.update_progress(state.cur_nimg // 1000, stop_at_nimg // 1000)
             if state.cur_nimg == stop_at_nimg and state.cur_nimg < total_nimg:
@@ -307,6 +355,23 @@ def training_loop(
                         pickle.dump(data, f)
                     dist.print0('done')
                     del data
+
+        # In-training FID validation (runs at snapshot boundaries).
+        if snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0):
+            try:
+                val_net = ema_val if ema_val is not None else net
+                maybe_validate(
+                    cur_nimg=state.cur_nimg,
+                    snapshot_nimg=snapshot_nimg,
+                    net_ema=val_net,
+                    encoder=encoder,
+                    run_dir=run_dir,
+                    dataset_kwargs=dataset_kwargs,
+                    validation_kwargs=validation_kwargs,
+                    wandb_run=wandb_run,
+                )
+            except Exception as _e:
+                dist.print0(f'[VAL] validation failed: {_e}')
 
         # Save state checkpoint.
         if checkpoint_nimg is not None and (done or state.cur_nimg % checkpoint_nimg == 0) and state.cur_nimg != start_nimg:
@@ -359,5 +424,13 @@ def training_loop(
                 p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
 
         cumulative_training_time += time.time() - batch_start_time
+
+    # Close W&B run.
+    try:
+        if wandb_run is not None and dist.get_rank() == 0:
+            import wandb as _wandb
+            _wandb.finish()
+    except Exception:
+        pass
 
 #----------------------------------------------------------------------------

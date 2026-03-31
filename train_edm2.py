@@ -145,6 +145,8 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     val_ref = opts.get('val_ref')
     if val_ref is not None:
         default_val_steps = opts.get('S', 8) if is_cd else 32
+        # CD: default to Euler (num_steps == num_NFEs); base training: default to Heun.
+        default_use_heun = not is_cd
         c.validation_kwargs = dnnlib.EasyDict(
             enabled=True,
             ref=val_ref,
@@ -157,6 +159,7 @@ def setup_training_config(preset='edm2-img512-s', **opts):
             sigma_max=opts.get('sigma_max', 80.0),
             rho=7.0,
             at_start=opts.get('val_at_start', False),
+            use_heun=opts.get('val_heun', default_use_heun),
         )
 
     # Weights & Biases configuration.
@@ -198,7 +201,11 @@ def print_training_config(run_dir, c):
     phema_kimg = (c.get('phema_snapshot_nimg') or c.snapshot_nimg or 0) // 1000
     dist.print0(f'Snapshot interval:       {snap_kimg} kimg  |  phEMA interval: {phema_kimg} kimg')
     if c.get('validation_kwargs') and c.validation_kwargs.get('enabled'):
-        dist.print0(f'Validation:              FID every {c.validation_kwargs.get("every",1)} snapshot(s), {c.validation_kwargs.get("num_images",50000)} images, {c.validation_kwargs.get("steps",8)} steps')
+        vk = c.validation_kwargs
+        steps = vk.get('steps', 8)
+        use_heun = vk.get('use_heun', False)
+        nfe = (2 * steps - 1) if use_heun else steps
+        dist.print0(f'Validation:              FID every {vk.get("every",1)} snapshot(s), {vk.get("num_images",50000)} images, {steps} steps ({nfe} NFEs, {"heun" if use_heun else "euler"})')
     if c.get('wandb_kwargs') and c.wandb_kwargs.get('enabled'):
         dist.print0(f'W&B:                     project={c.wandb_kwargs.get("project")}, entity={c.wandb_kwargs.get("entity")}')
     dist.print0()
@@ -315,6 +322,7 @@ def parse_int_list(s):
 @click.option('--val_seed',         help='Validation base seed', type=int, default=0, show_default=True)
 @click.option('--val_batch',        help='Validation batch size per GPU', type=int, default=32, show_default=True)
 @click.option('--val_at_start',     help='Run validation at first snapshot', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--val_heun',         help='Use Heun (2nd-order) sampler for val; default False for CD, True for base', metavar='BOOL', type=bool, default=None)
 
 # ── Weights & Biases ──
 @click.option('--wandb',            help='Enable W&B logging', metavar='BOOL', type=bool, default=False, show_default=True)

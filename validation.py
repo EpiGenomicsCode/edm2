@@ -25,6 +25,21 @@ import tqdm
 from generate_images import edm_sampler, StackedRandomGenerator
 
 #----------------------------------------------------------------------------
+# Pure first-order Euler sampler (S_churn=0, no 2nd-order correction).
+# Used for CD validation so that num_steps == num_NFEs, matching EDM1 behavior.
+
+def _euler_sampler(net, noise, labels, *, num_steps, sigma_min, sigma_max, rho, randn_like):
+    dtype = torch.float32
+    step_indices = torch.arange(num_steps, dtype=dtype, device=noise.device)
+    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])
+    x = noise.to(dtype) * t_steps[0]
+    for t_cur, t_next in zip(t_steps[:-1], t_steps[1:]):
+        d = (x - net(x, t_cur, labels).to(dtype)) / t_cur
+        x = x + (t_next - t_cur) * d
+    return x
+
+#----------------------------------------------------------------------------
 
 def _load_inception_detector(device: torch.device):
     if dist.get_rank() != 0:
@@ -103,14 +118,24 @@ def run_fid_validation(
     rho: float = 7.0,
     ref: Optional[str] = None,
     step_kimg: Optional[int] = None,
+    use_heun: bool = False,
     wandb_run=None,
 ) -> Dict[str, Any]:
-    """Compute FID by generating images with the given network (ema_val)."""
+    """Compute FID by generating images with the given network (ema_val).
+
+    use_heun=False (default): pure Euler ODE, num_steps == num_NFEs. Matches EDM1
+      CD validation and is correct for evaluating a consistency model student.
+    use_heun=True: 2nd-order Heun correction, NFEs = 2*num_steps-1. Appropriate
+      for evaluating a full diffusion model (e.g. base EDM2 training).
+    """
     device = torch.device('cuda')
     world_size = dist.get_world_size()
     rank = dist.get_rank()
 
     net = net.eval().requires_grad_(False).to(device)
+
+    nfe = num_steps if not use_heun else (2 * num_steps - 1)
+    sampler_label = f'heun({nfe} NFEs)' if use_heun else f'euler({nfe} NFEs)'
 
     mu_ref, sigma_ref = _prepare_reference_stats(ref, device=device)
     detector, detector_kwargs, feature_dim = _load_inception_detector(device)
@@ -120,7 +145,7 @@ def run_fid_validation(
     all_batches = all_indices.tensor_split(num_batches)
     rank_batches = all_batches[rank :: world_size]
 
-    dist.print0(f'[VAL] Starting: num_images={num_images}, batches={num_batches}, batch_per_gpu={batch}, steps={num_steps}')
+    dist.print0(f'[VAL] Starting: num_images={num_images}, batches={num_batches}, batch_per_gpu={batch}, steps={num_steps}, sampler={sampler_label}')
 
     mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
     sigma = torch.zeros([feature_dim, feature_dim], dtype=torch.float64, device=device)
@@ -150,11 +175,18 @@ def run_fid_validation(
         if use_labels:
             class_labels = torch.eye(label_dim, device=device)[rnd.randint(label_dim, size=[bsize], device=device)]
 
-        latents = edm_sampler(
-            net, noise, labels=class_labels,
-            num_steps=num_steps, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho,
-            randn_like=rnd.randn_like,
-        )
+        if use_heun:
+            latents = edm_sampler(
+                net, noise, labels=class_labels,
+                num_steps=num_steps, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho,
+                randn_like=rnd.randn_like,
+            )
+        else:
+            latents = _euler_sampler(
+                net, noise, labels=class_labels,
+                num_steps=num_steps, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho,
+                randn_like=rnd.randn_like,
+            )
 
         images_u8 = encoder.decode(latents)
 
@@ -248,6 +280,7 @@ def maybe_validate(
         rho=float(validation_kwargs.get('rho', 7.0)),
         ref=validation_kwargs.get('ref', None),
         step_kimg=int(cur_nimg // 1000),
+        use_heun=bool(validation_kwargs.get('use_heun', False)),
         wandb_run=wandb_run,
     )
 

@@ -175,12 +175,16 @@ def training_loop(
     state = dnnlib.EasyDict(cur_nimg=0, total_elapsed_time=0)
 
     # DDP: tuned kwargs for CD mode, default for base training.
+    # find_unused_parameters=True is required in CD mode because some network
+    # parameters (e.g. attention, label embedding) may be skipped in certain
+    # micro-batches depending on the loss mask, causing DDP reducer errors.
     if is_cd_mode:
         ddp = torch.nn.parallel.DistributedDataParallel(
             net, device_ids=[device],
             broadcast_buffers=False,
             gradient_as_bucket_view=True,
             bucket_cap_mb=100,
+            find_unused_parameters=True,
         )
     else:
         ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])

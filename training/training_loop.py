@@ -74,8 +74,9 @@ def training_loop(
     total_nimg          = 8<<30,    # Train for a total of N training images.
     slice_nimg          = None,     # Train for a maximum of N training images in one invocation. None = no limit.
     status_nimg         = 128<<10,  # Report status every N training images. None = disable.
-    snapshot_nimg       = 8<<20,    # Save network snapshot every N training images. None = disable.
+    snapshot_nimg       = 8<<20,    # Save network snapshot (ema_val / base) every N training images. None = disable.
     checkpoint_nimg     = 128<<20,  # Save state checkpoint every N training images. None = disable.
+    phema_snapshot_nimg = None,     # Save phEMA snapshots every N training images. None = use snapshot_nimg.
 
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     force_finite        = True,     # Get rid of NaN/Inf gradients before feeding them to the optimizer.
@@ -321,10 +322,16 @@ def training_loop(
             if dist.should_stop() or dist.should_suspend():
                 done = True
 
-        # Save network snapshot.
-        if snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0) and dist.get_rank() == 0:
+        # Determine whether this step is a snapshot or phEMA boundary.
+        # phema_snapshot_nimg controls how often phEMA PKLs are written; if None, falls back to snapshot_nimg.
+        _snap_boundary  = snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0)
+        _phema_nimg     = phema_snapshot_nimg if phema_snapshot_nimg is not None else snapshot_nimg
+        _phema_boundary = _phema_nimg is not None and state.cur_nimg % _phema_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0)
+
+        # Save primary network snapshot (ema_val in CD mode, or phEMA in base mode).
+        if _snap_boundary and dist.get_rank() == 0:
             if is_cd_mode:
-                # CD mode: save ema_val as the primary EMA snapshot.
+                # CD mode: save exponential EMA (ema_val) as the main snapshot.
                 data = dnnlib.EasyDict(encoder=encoder, dataset_kwargs=dataset_kwargs)
                 data.ema = copy.deepcopy(ema_val).cpu().eval().requires_grad_(False).to(torch.float16)
                 fname = f'network-snapshot-{state.cur_nimg//1000:07d}.pkl'
@@ -333,8 +340,13 @@ def training_loop(
                     pickle.dump(data, f)
                 dist.print0('done')
                 del data
+            else:
+                # Base training: primary snapshot = phEMA (saved at _phema_boundary below).
+                pass
 
-                # Also save phema snapshots if enabled.
+        # Save phEMA snapshots at their own (typically less frequent) interval.
+        if _phema_boundary and dist.get_rank() == 0:
+            if is_cd_mode:
                 if ema is not None:
                     ema_list = ema.get() if isinstance(ema.get(), list) else [(ema.get(), '')]
                     for ema_net, ema_suffix in ema_list:
@@ -347,7 +359,7 @@ def training_loop(
                         dist.print0('done')
                         del data
             else:
-                # Base training: save phema snapshots (original behavior).
+                # Base training: save phEMA snapshots.
                 ema_list = ema.get() if ema is not None else optimizer.get_ema(net) if hasattr(optimizer, 'get_ema') else net
                 ema_list = ema_list if isinstance(ema_list, list) else [(ema_list, '')]
                 for ema_net, ema_suffix in ema_list:

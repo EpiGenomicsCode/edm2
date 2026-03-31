@@ -107,6 +107,7 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     c.status_nimg = opts.get('status', 0) or None
     c.snapshot_nimg = opts.get('snapshot', 0) or None
     c.checkpoint_nimg = opts.get('checkpoint', 0) or None
+    c.phema_snapshot_nimg = opts.get('phema_snap', 0) or None
     c.seed = opts.get('seed', 0)
 
     # CD-specific configuration.
@@ -193,6 +194,9 @@ def print_training_config(run_dir, c):
         dist.print0(f'Teacher:                 {c.teacher_pkl}')
         dist.print0(f'CD params:               S={c.cd_kwargs["S"]}, T={c.cd_kwargs["T_start"]}->{c.cd_kwargs["T_end"]}')
         dist.print0(f'CD loss:                 {c.cd_kwargs["loss_type"]} / {c.cd_kwargs["weight_mode"]}')
+    snap_kimg  = (c.snapshot_nimg or 0) // 1000
+    phema_kimg = (c.get('phema_snapshot_nimg') or c.snapshot_nimg or 0) // 1000
+    dist.print0(f'Snapshot interval:       {snap_kimg} kimg  |  phEMA interval: {phema_kimg} kimg')
     if c.get('validation_kwargs') and c.validation_kwargs.get('enabled'):
         dist.print0(f'Validation:              FID every {c.validation_kwargs.get("every",1)} snapshot(s), {c.validation_kwargs.get("num_images",50000)} images, {c.validation_kwargs.get("steps",8)} steps')
     if c.get('wandb_kwargs') and c.wandb_kwargs.get('enabled'):
@@ -267,9 +271,10 @@ def parse_int_list(s):
 @click.option('--workers',          help='DataLoader worker processes', metavar='INT',           type=click.IntRange(min=0), default=2, show_default=True)
 
 # I/O-related options.
-@click.option('--status',           help='Interval of status prints', metavar='NIMG',           type=parse_nimg, default='128Ki', show_default=True)
-@click.option('--snapshot',         help='Interval of network snapshots', metavar='NIMG',       type=parse_nimg, default='8Mi', show_default=True)
-@click.option('--checkpoint',       help='Interval of training checkpoints', metavar='NIMG',    type=parse_nimg, default='128Mi', show_default=True)
+@click.option('--status',           help='Interval of status prints', metavar='NIMG',                type=parse_nimg, default='128Ki', show_default=True)
+@click.option('--snapshot',         help='Interval of network snapshots (ema_val / base)', metavar='NIMG', type=parse_nimg, default='8Mi', show_default=True)
+@click.option('--phema_snap',       help='Interval of phEMA snapshots (default: same as --snapshot)', metavar='NIMG', type=parse_nimg, default=None, show_default=True)
+@click.option('--checkpoint',       help='Interval of training checkpoints', metavar='NIMG',       type=parse_nimg, default='128Mi', show_default=True)
 @click.option('--seed',             help='Random seed', metavar='INT',                          type=int, default=0, show_default=True)
 @click.option('-n', '--dry-run',    help='Print training options and exit',                     is_flag=True)
 

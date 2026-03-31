@@ -114,7 +114,6 @@ def setup_training_config(preset='edm2-img512-s', **opts):
         c.teacher_pkl = opts['teacher']
         cd_S = opts.get('S', 8)
         c.cd_kwargs = dict(
-            teacher_pkl_path=opts['teacher'],
             S=cd_S,
             T_start=opts.get('T_start', 256),
             T_end=opts.get('T_end', 1024),

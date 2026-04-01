@@ -311,6 +311,11 @@ def training_loop(
                     import wandb as _wandb
                     log_dict = {name: value.mean for name, value in training_stats.default_collector.as_dict().items() if np.isfinite(value.mean)}
                     log_dict['progress_kimg'] = state.cur_nimg / 1e3
+                    if is_cd_mode and hasattr(loss_fn, '_current_T_edges'):
+                        try:
+                            log_dict['cd_T_edges'] = int(loss_fn._current_T_edges())
+                        except Exception:
+                            pass
                     _wandb.log(log_dict, commit=True)
                 except Exception as _e:
                     dist.print0(f'[W&B] log failed: {_e}')

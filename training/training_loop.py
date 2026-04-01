@@ -8,6 +8,9 @@
 """Main training loop with optional Consistency Distillation (CD) support."""
 
 import os
+import re
+import json
+import glob
 import time
 import copy
 import pickle
@@ -55,6 +58,83 @@ def learning_rate_schedule(cur_nimg, batch_size, ref_lr=100e-4, ref_batches=70e3
     return lr
 
 #----------------------------------------------------------------------------
+# Prune old checkpoints / snapshots (same idea as EDM CD training_loop).
+
+def _cleanup_checkpoint_artifacts(run_dir, *, keep_recent, cleanup_snapshots):
+    """Keep the `keep_recent` newest training-state-*.pt files plus the .pt for the best
+    validation FID in metrics-val.jsonl (when present).  Optionally prune *primary* EMA
+    snapshots `network-snapshot-{kimg}.pkl` only.  phEMA dumps (`network-snapshot-*-*.pkl`)
+    are never deleted — they follow their own --phema_snap schedule."""
+    def _state_kimg(path):
+        m = re.match(r'^training-state-(\d+)\.pt$', os.path.basename(path))
+        return int(m.group(1)) if m else -1
+
+    metrics_path = os.path.join(run_dir, 'metrics-val.jsonl')
+    best_kimg = None
+    if os.path.isfile(metrics_path):
+        try:
+            best_fid = float('inf')
+            best_entry = None
+            with open(metrics_path, 'rt') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    fid = row.get('fid')
+                    kimg = row.get('kimg')
+                    if fid is None or kimg is None:
+                        continue
+                    if float(fid) < best_fid:
+                        best_fid = float(fid)
+                        best_entry = row
+            if best_entry is not None:
+                best_kimg = int(best_entry['kimg'])
+        except Exception:
+            pass
+
+    all_states = sorted(
+        glob.glob(os.path.join(run_dir, 'training-state-*.pt')),
+        key=_state_kimg,
+    )
+    if not all_states:
+        return
+
+    protected = set(all_states[-keep_recent:])
+    if best_kimg is not None:
+        best_path = os.path.join(run_dir, f'training-state-{best_kimg:07d}.pt')
+        if os.path.isfile(best_path):
+            protected.add(best_path)
+
+    for p in all_states:
+        if p not in protected:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    if not cleanup_snapshots:
+        return
+
+    protected_kmigs = {_state_kimg(p) for p in protected}
+
+    # Only prune the main snapshot PKL (no std suffix). Never touch phEMA files.
+    for p in glob.glob(os.path.join(run_dir, 'network-snapshot-*.pkl')):
+        base = os.path.basename(p)
+        m = re.match(r'^network-snapshot-(\d{7})\.pkl$', base)
+        if not m:
+            continue
+        kimg = int(m.group(1))
+        if kimg not in protected_kmigs:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+#----------------------------------------------------------------------------
 # Main training loop.
 
 def training_loop(
@@ -77,6 +157,8 @@ def training_loop(
     snapshot_nimg       = 8<<20,    # Save network snapshot (ema_val / base) every N training images. None = disable.
     checkpoint_nimg     = 128<<20,  # Save state checkpoint every N training images. None = disable.
     phema_snapshot_nimg = None,     # Save phEMA snapshots every N training images. None = use snapshot_nimg.
+    checkpoint_keep_recent = 3,     # Retain this many newest training-state-*.pt (+ best-FID .pt).
+    checkpoint_cleanup_snapshots = True,  # Prune primary network-snapshot-{kimg}.pkl only; never phEMA *-*.
 
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     force_finite        = True,     # Get rid of NaN/Inf gradients before feeding them to the optimizer.
@@ -398,6 +480,13 @@ def training_loop(
         if checkpoint_nimg is not None and (done or state.cur_nimg % checkpoint_nimg == 0) and state.cur_nimg != start_nimg:
             checkpoint.save(os.path.join(run_dir, f'training-state-{state.cur_nimg//1000:07d}.pt'))
             misc.check_ddp_consistency(net)
+            if dist.get_rank() == 0:
+                _cleanup_checkpoint_artifacts(
+                    run_dir,
+                    keep_recent=max(1, int(checkpoint_keep_recent)),
+                    cleanup_snapshots=bool(checkpoint_cleanup_snapshots),
+                )
+            torch.distributed.barrier()
 
         # Done?
         if done:

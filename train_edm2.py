@@ -108,6 +108,8 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     c.snapshot_nimg = opts.get('snapshot', 0) or None
     c.checkpoint_nimg = opts.get('checkpoint', 0) or None
     c.phema_snapshot_nimg = opts.get('phema_snap', 0) or None
+    c.checkpoint_keep_recent = int(opts.get('checkpoint_keep_recent', 3))
+    c.checkpoint_cleanup_snapshots = not bool(opts.get('no_checkpoint_snapshot_prune', False))
     c.seed = opts.get('seed', 0)
 
     # CD-specific configuration.
@@ -282,6 +284,8 @@ def parse_int_list(s):
 @click.option('--snapshot',         help='Interval of network snapshots (ema_val / base)', metavar='NIMG', type=parse_nimg, default='8Mi', show_default=True)
 @click.option('--phema_snap',       help='Interval of phEMA snapshots (default: same as --snapshot)', metavar='NIMG', type=parse_nimg, default=None, show_default=True)
 @click.option('--checkpoint',       help='Interval of training checkpoints', metavar='NIMG',       type=parse_nimg, default='128Mi', show_default=True)
+@click.option('--checkpoint_keep_recent', help='Retain N newest training-state .pt plus best-FID .pt', type=click.IntRange(min=1), default=3, show_default=True)
+@click.option('--no_checkpoint_snapshot_prune', help='Keep all primary network-snapshot-{kimg}.pkl (phEMA *-* files are never pruned)', is_flag=True, default=False)
 @click.option('--seed',             help='Random seed', metavar='INT',                          type=int, default=0, show_default=True)
 @click.option('-n', '--dry-run',    help='Print training options and exit',                     is_flag=True)
 

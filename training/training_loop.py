@@ -298,7 +298,8 @@ def training_loop(
         dist.print0(f'[CD EMA] Validation EMA: halflife={ema_halflife_kimg} kimg, rampup={ema_rampup_ratio}')
 
     # Load previous checkpoint and decide how long to train.
-    checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema)
+    # ema_val is included so the validation EMA survives job restarts without needing to re-ramp.
+    checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema, ema_val=ema_val)
     checkpoint.load_latest(run_dir)
 
     # Re-attach teacher after checkpoint load (OD-8).

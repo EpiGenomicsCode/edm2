@@ -113,6 +113,11 @@ class CheckpointIO:
             print0(f'Loading {pt_path} ... ', end='', flush=True)
         data = torch.load(pt_path, map_location=torch.device('cpu'))
         for name, obj in self._state_objs.items():
+            if name not in data:
+                # Key absent in older checkpoints (e.g. ema_val added later); skip gracefully.
+                if verbose:
+                    print0(f'  [CheckpointIO] key "{name}" not found in checkpoint, skipping.')
+                continue
             if obj is None:
                 pass
             elif isinstance(obj, dict):

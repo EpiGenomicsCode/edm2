@@ -127,12 +127,14 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     # CD-specific configuration.
     if is_cd:
         c.teacher_pkl = opts['teacher']
-        cd_S = opts.get('S', 8)
+        # NOTE: Click 8.x lowercases all parameter names derived from option strings,
+        # so --S → 's', --T_start → 't_start', --T_end → 't_end', --T_anneal_kimg → 't_anneal_kimg'.
+        cd_S = opts.get('s', 8)
         c.cd_kwargs = dict(
             S=cd_S,
-            T_start=opts.get('T_start', 256),
-            T_end=opts.get('T_end', 1024),
-            T_anneal_kimg=opts.get('T_anneal_kimg', 750),
+            T_start=opts.get('t_start', 256),
+            T_end=opts.get('t_end', 1024),
+            T_anneal_kimg=opts.get('t_anneal_kimg', 750),
             rho=7.0,
             sigma_min=opts.get('sigma_min', 0.002),
             sigma_max=opts.get('sigma_max', 80.0),
@@ -158,7 +160,7 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     # Validation configuration (in-training FID).
     val_ref = opts.get('val_ref')
     if val_ref is not None:
-        default_val_steps = opts.get('S', 8) if is_cd else 32
+        default_val_steps = opts.get('s', 8) if is_cd else 32
         # CD: default to Euler (num_steps == num_NFEs); base training: default to Heun.
         default_use_heun = not is_cd
         c.validation_kwargs = dnnlib.EasyDict(

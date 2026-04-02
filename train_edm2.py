@@ -10,6 +10,7 @@
 with optional Multi-Step Consistency Distillation (MSCD) support."""
 
 import os
+import re
 import json
 import warnings
 import click
@@ -302,6 +303,8 @@ def parse_int_list(s):
 @click.option('--no_checkpoint_snapshot_prune', help='Keep all primary network-snapshot-{kimg}.pkl (phEMA *-* files are never pruned)', is_flag=True, default=False)
 @click.option('--seed',             help='Random seed', metavar='INT',                          type=int, default=0, show_default=True)
 @click.option('--resume',           help='Resume from training-state-*.pt', metavar='PT',       type=str, default=None)
+@click.option('--nosubdir',         help='Do not create a numbered subdirectory inside --outdir', is_flag=True)
+@click.option('--desc',             help='String to include in the output directory name',      metavar='STR', type=str, default=None)
 @click.option('-n', '--dry-run',    help='Print training options and exit',                     is_flag=True)
 
 # ── Teacher / CD core ──
@@ -351,7 +354,7 @@ def parse_int_list(s):
 @click.option('--wandb_tags',       help='W&B tags (comma-separated)', type=str, default=None)
 @click.option('--wandb_mode',       help='W&B mode', type=click.Choice(['online','offline','disabled']), default='online', show_default=True)
 
-def cmdline(outdir, dry_run, **opts):
+def cmdline(outdir, dry_run, nosubdir, desc, **opts):
     """Train diffusion models according to the EDM2 recipe from the paper
     "Analyzing and Improving the Training Dynamics of Diffusion Models",
     with optional Multi-Step Consistency Distillation (MSCD) support.
@@ -359,17 +362,17 @@ def cmdline(outdir, dry_run, **opts):
     Examples:
 
     \b
-    # Train XS-sized model for ImageNet-512 using 8 GPUs
+    # Train XS-sized model for ImageNet-512 using 8 GPUs (creates training-runs/00000-edm2-img512-s-...)
     torchrun --standalone --nproc_per_node=8 train_edm2.py \\
-        --outdir=training-runs/00000-edm2-img512-xs \\
+        --outdir=training-runs \\
         --data=datasets/img512-sd.zip \\
-        --preset=edm2-img512-xs \\
+        --preset=edm2-img512-s \\
         --batch-gpu=32
 
     \b
     # Consistency distillation from a pre-trained teacher
     torchrun --standalone --nproc_per_node=8 train_edm2.py \\
-        --outdir=training-runs/00001-cd-img512-s \\
+        --outdir=training-runs \\
         --data=datasets/img512-sd.zip \\
         --preset=edm2-img512-s \\
         --teacher=path/to/teacher.pkl \\
@@ -377,17 +380,58 @@ def cmdline(outdir, dry_run, **opts):
         --batch-gpu=32
 
     \b
-    # To resume training, run the same command again.
+    # Use --nosubdir to write directly into --outdir (e.g. for explicit resume paths).
     """
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
     dist.print0('Setting up training config...')
     c = setup_training_config(**opts)
-    print_training_config(run_dir=outdir, c=c)
+
+    # Determine run directory (rank-0 only; broadcast to others via the training loop).
+    # Mirrors EDM1: by default creates a numbered subdirectory inside --outdir so that
+    # re-submitting the same script never clobbers a previous run.
+    if nosubdir:
+        run_dir = outdir
+    else:
+        # Build a short description string from key config fields.
+        data_name = os.path.splitext(os.path.basename(opts.get('data', 'data')))[0]
+        cond_str  = 'cond' if c.dataset_kwargs.get('use_labels', False) else 'uncond'
+        dtype_str = 'fp16' if c.network_kwargs.get('use_fp16', False) else 'fp32'
+        preset    = opts.get('preset', 'custom')
+        gpus      = dist.get_world_size()
+        batch     = c.batch_size
+        auto_desc = f'{data_name}-{cond_str}-{preset}-gpus{gpus}-batch{batch}-{dtype_str}'
+        if c.get('teacher_pkl'):
+            cd_S     = c.cd_kwargs.get('S', 8)
+            cd_Ts    = c.cd_kwargs.get('T_start', 64)
+            cd_Te    = c.cd_kwargs.get('T_end', 1280)
+            auto_desc += f'-cdS{cd_S}-T{cd_Ts}-{cd_Te}'
+        if desc is not None:
+            auto_desc += f'-{desc}'
+
+        # Find the next available run ID (same logic as EDM1).
+        if dist.get_rank() == 0:
+            prev_run_dirs = []
+            if os.path.isdir(outdir):
+                prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
+            prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
+            prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
+            cur_run_id   = max(prev_run_ids, default=-1) + 1
+            run_dir      = os.path.join(outdir, f'{cur_run_id:05d}-{auto_desc}')
+            assert not os.path.exists(run_dir), f'Run directory already exists: {run_dir}'
+        else:
+            run_dir = None
+
+        # Broadcast run_dir from rank 0 to all other ranks.
+        run_dir_list = [run_dir]
+        torch.distributed.broadcast_object_list(run_dir_list, src=0)
+        run_dir = run_dir_list[0]
+
+    print_training_config(run_dir=run_dir, c=c)
     if dry_run:
         dist.print0('Dry run; exiting.')
     else:
-        launch_training(run_dir=outdir, c=c)
+        launch_training(run_dir=run_dir, c=c)
 
 #----------------------------------------------------------------------------
 

@@ -260,17 +260,27 @@ def training_loop(
     dist.print0('Setting up training state...')
     state = dnnlib.EasyDict(cur_nimg=0, total_elapsed_time=0)
 
-    # DDP: tuned kwargs for CD mode, default for base training.
-    # find_unused_parameters=True is required in CD mode because some network
-    # parameters (e.g. attention, label embedding) may be skipped in certain
-    # micro-batches depending on the loss mask, causing DDP reducer errors.
+    # In CD mode, the logvar head (logvar_linear) is never called because we always
+    # invoke net(x, sigma, labels) without return_logvar=True.  Freezing it ensures
+    # every trainable DDP parameter receives a gradient on every step, so we can use
+    # plain DDP without find_unused_parameters=True.
+    #
+    # find_unused_parameters=True would cause DDP to re-traverse the autograd graph
+    # and reset reducer bookkeeping after the no-grad target forward (the second DDP
+    # call inside loss_cd.py), leading to out_gain (and possibly other parameters)
+    # not being correctly all-reduced across nodes.  This is exactly the root cause of
+    # "AssertionError: Precond.unet.out_gain" at check_ddp_consistency time.
+    #
+    # TCM solves this the same way: their Precond has no logvar head at all, so they
+    # never need find_unused_parameters=True.
     if is_cd_mode:
+        net.logvar_linear.requires_grad_(False)
+        dist.print0('[CD] Froze logvar_linear (not used in CD mode) — DDP find_unused_parameters=False.')
         ddp = torch.nn.parallel.DistributedDataParallel(
             net, device_ids=[device],
             broadcast_buffers=False,
             gradient_as_bucket_view=True,
             bucket_cap_mb=100,
-            find_unused_parameters=True,
         )
     else:
         ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])

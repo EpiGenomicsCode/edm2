@@ -112,6 +112,18 @@ def setup_training_config(preset='edm2-img512-s', **opts):
     c.checkpoint_cleanup_snapshots = not bool(opts.get('no_checkpoint_snapshot_prune', False))
     c.seed = opts.get('seed', 0)
 
+    # Resume from explicit checkpoint.
+    # Unlike EDM1, EDM2's CheckpointIO saves ALL state (net, optimizer, ema, ema_val, cur_nimg)
+    # in a single .pt file, so only resume_state_dump is needed — no separate pkl is required.
+    import re as _re
+    resume_pt = opts.get('resume')
+    if resume_pt is not None:
+        if not _re.fullmatch(r'training-state-(\d+)\.pt', os.path.basename(resume_pt)):
+            raise click.ClickException('--resume must point to a training-state-*.pt file from a previous run')
+        if not os.path.isfile(resume_pt):
+            raise click.ClickException(f'--resume: file not found: {resume_pt}')
+        c.resume_state_dump = resume_pt
+
     # CD-specific configuration.
     if is_cd:
         c.teacher_pkl = opts['teacher']
@@ -287,6 +299,7 @@ def parse_int_list(s):
 @click.option('--checkpoint_keep_recent', help='Retain N newest training-state .pt plus best-FID .pt', type=click.IntRange(min=1), default=3, show_default=True)
 @click.option('--no_checkpoint_snapshot_prune', help='Keep all primary network-snapshot-{kimg}.pkl (phEMA *-* files are never pruned)', is_flag=True, default=False)
 @click.option('--seed',             help='Random seed', metavar='INT',                          type=int, default=0, show_default=True)
+@click.option('--resume',           help='Resume from training-state-*.pt', metavar='PT',       type=str, default=None)
 @click.option('-n', '--dry-run',    help='Print training options and exit',                     is_flag=True)
 
 # ── Teacher / CD core ──

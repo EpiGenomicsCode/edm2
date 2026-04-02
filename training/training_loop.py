@@ -160,6 +160,9 @@ def training_loop(
     checkpoint_keep_recent = 3,     # Retain this many newest training-state-*.pt (+ best-FID .pt).
     checkpoint_cleanup_snapshots = True,  # Prune primary network-snapshot-{kimg}.pkl only; never phEMA *-*.
 
+    resume_pkl          = None,     # Load network weights from this snapshot PKL before training. None = skip.
+    resume_state_dump   = None,     # Load full training state from this .pt file. None = fresh start.
+
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     force_finite        = True,     # Get rid of NaN/Inf gradients before feeding them to the optimizer.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
@@ -297,10 +300,26 @@ def training_loop(
         # If student was seeded from teacher, ema_val starts from teacher weights too.
         dist.print0(f'[CD EMA] Validation EMA: halflife={ema_halflife_kimg} kimg, rampup={ema_rampup_ratio}')
 
-    # Load previous checkpoint and decide how long to train.
-    # ema_val is included so the validation EMA survives job restarts without needing to re-ramp.
+    # Explicit resume: load network weights from PKL, then full training state from .pt.
+    # No auto-resume; a checkpoint is only loaded when --resume is explicitly provided.
     checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema, ema_val=ema_val)
-    checkpoint.load_latest(run_dir)
+
+    if resume_pkl is not None:
+        dist.print0(f'Loading network weights from "{resume_pkl}"...')
+        if dist.get_rank() != 0:
+            torch.distributed.barrier()
+        with dnnlib.util.open_url(resume_pkl, verbose=(dist.get_rank() == 0)) as f:
+            resume_data = pickle.load(f)
+        if dist.get_rank() == 0:
+            torch.distributed.barrier()
+        misc.copy_params_and_buffers(src_module=resume_data['ema'], dst_module=net, require_all=False)
+        if ema_val is not None:
+            misc.copy_params_and_buffers(src_module=resume_data['ema'], dst_module=ema_val, require_all=False)
+        del resume_data
+
+    if resume_state_dump is not None:
+        dist.print0(f'Loading training state from "{resume_state_dump}"...')
+        checkpoint.load(resume_state_dump)
 
     # Re-attach teacher after checkpoint load (OD-8).
     if is_cd_mode and hasattr(loss_fn, 'teacher_net') and loss_fn.teacher_net is None:

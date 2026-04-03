@@ -22,22 +22,7 @@ from torch_utils import distributed as dist
 from torch_utils import misc
 import tqdm
 
-from generate_images import edm_sampler, StackedRandomGenerator
-
-#----------------------------------------------------------------------------
-# Pure first-order Euler sampler (S_churn=0, no 2nd-order correction).
-# Used for CD validation so that num_steps == num_NFEs, matching EDM1 behavior.
-
-def _euler_sampler(net, noise, labels, *, num_steps, sigma_min, sigma_max, rho, randn_like):
-    dtype = torch.float32
-    step_indices = torch.arange(num_steps, dtype=dtype, device=noise.device)
-    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
-    t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])
-    x = noise.to(dtype) * t_steps[0]
-    for t_cur, t_next in zip(t_steps[:-1], t_steps[1:]):
-        d = (x - net(x, t_cur, labels).to(dtype)) / t_cur
-        x = x + (t_next - t_cur) * d
-    return x
+from generate_images import edm_sampler, euler_sampler, StackedRandomGenerator
 
 #----------------------------------------------------------------------------
 
@@ -182,7 +167,7 @@ def run_fid_validation(
                 randn_like=rnd.randn_like,
             )
         else:
-            latents = _euler_sampler(
+            latents = euler_sampler(
                 net, noise, labels=class_labels,
                 num_steps=num_steps, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho,
                 randn_like=rnd.randn_like,

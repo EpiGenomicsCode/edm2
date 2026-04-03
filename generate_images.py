@@ -122,6 +122,40 @@ def edm_sampler(
     return x_next
 
 #----------------------------------------------------------------------------
+# Pure first-order Euler (no Heun correction). num_steps == num_NFEs when S_churn=0.
+# Matches validation.run_fid_validation(use_heun=False) for CD / consistency training.
+
+def euler_sampler(
+    net, noise, labels=None, gnet=None,
+    num_steps=32, sigma_min=0.002, sigma_max=80, rho=7, guidance=1,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    dtype=torch.float32, randn_like=torch.randn_like,
+):
+    def denoise(x, t):
+        Dx = net(x, t, labels).to(dtype)
+        if guidance == 1:
+            return Dx
+        ref_Dx = gnet(x, t, labels).to(dtype)
+        return ref_Dx.lerp(Dx, guidance)
+
+    step_indices = torch.arange(num_steps, dtype=dtype, device=noise.device)
+    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])
+    x_next = noise.to(dtype) * t_steps[0]
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+        x_cur = x_next
+        if S_churn > 0 and S_min <= t_cur <= S_max:
+            gamma = min(S_churn / num_steps, np.sqrt(2) - 1)
+            t_hat = t_cur + gamma * t_cur
+            x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+        else:
+            t_hat = t_cur
+            x_hat = x_cur
+        d_cur = (x_hat - denoise(x_hat, t_hat)) / t_hat
+        x_next = x_hat + (t_next - t_hat) * d_cur
+    return x_next
+
+#----------------------------------------------------------------------------
 # Wrapper for torch.Generator that allows specifying a different random seed
 # for each sample in a minibatch.
 
@@ -284,8 +318,10 @@ def parse_int_list(s):
 @click.option('--S_min', 'S_min',           help='Stoch. min noise level', metavar='FLOAT',                         type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_max', 'S_max',           help='Stoch. max noise level', metavar='FLOAT',                         type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',       help='Stoch. noise inflation', metavar='FLOAT',                         type=float, default=1, show_default=True)
+@click.option('--sampler',                   help='"edm" = Heun-style edm_sampler (default). "euler" = pure Euler, 1 NFE/step (matches CD --val with --val_heun=0).', type=click.Choice(['edm', 'euler']), default='edm', show_default=True)
+@click.option('--euler',                     help='Shortcut for --sampler=euler (match in-training CD FID / W&B).', is_flag=True, default=False)
 
-def cmdline(preset, **opts):
+def cmdline(preset, euler, **opts):
     """Generate random images using the given model.
 
     Examples:
@@ -298,6 +334,11 @@ def cmdline(preset, **opts):
     # Generate 50000 images using 8 GPUs and save them as out/*/*.png
     torchrun --standalone --nproc_per_node=8 generate_images.py \\
         --preset=edm2-img64-s-fid --outdir=out --subdirs --seeds=0-49999
+
+    \b
+    # Same ODE as in-training CD FID (Euler, num_steps NFEs) — match W&B validation
+    torchrun --standalone --nproc_per_node=8 generate_images.py \\
+        --net=model.pkl --outdir=out --subdirs --seeds=0-49999 --steps=8 --euler
     """
     opts = dnnlib.EasyDict(opts)
 
@@ -317,6 +358,11 @@ def cmdline(preset, **opts):
         opts.gnet = None
     elif opts.gnet is None:
         raise click.ClickException('Please specify --gnet when using guidance')
+
+    if euler:
+        opts.sampler = 'euler'
+    opts.sampler_fn = euler_sampler if opts.sampler == 'euler' else edm_sampler
+    del opts.sampler
 
     # Generate.
     dist.init()

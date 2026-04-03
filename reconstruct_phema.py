@@ -22,9 +22,9 @@ from torch_utils import persistence
 
 warnings.filterwarnings('ignore', 'You are using `torch.load` with `weights_only=False`')
 
-# Register persistence hooks so pickled snapshots containing CD classes can be loaded.
-persistence.import_hook('training.loss_cd')
-persistence.import_hook('training.consistency_ops')
+# Ensure CD modules are importable when loading pickled training snapshots (same as generate_images.py).
+import training.loss_cd         # noqa: F401
+import training.consistency_ops  # noqa: F401
 
 #----------------------------------------------------------------------------
 # Construct the full path of a network pickle.

@@ -543,6 +543,23 @@ def training_loop(
         training_stats.report('Loss/learning_rate', lr)
         for g in optimizer.param_groups:
             g['lr'] = lr
+
+        # Compute gradient norm before sanitization — this is the diagnostic signal.
+        # Pre-sanitization norm exposes NaN/Inf gradients that force_finite would silently mask.
+        grad_sq_sum = torch.zeros([], device=device)
+        num_nan_inf_grads = 0
+        for param in net.parameters():
+            if param.grad is not None:
+                g = param.grad
+                is_bad = ~torch.isfinite(g)
+                if is_bad.any():
+                    num_nan_inf_grads += 1
+                else:
+                    grad_sq_sum += g.float().square().sum()
+        grad_norm_pre = grad_sq_sum.sqrt()
+        training_stats.report('Loss/grad_norm', grad_norm_pre)
+        training_stats.report('Loss/nan_inf_grad_count', torch.as_tensor(float(num_nan_inf_grads), device=device))
+
         if force_finite:
             for param in net.parameters():
                 if param.grad is not None:
